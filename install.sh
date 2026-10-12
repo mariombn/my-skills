@@ -6,9 +6,9 @@ set -eo pipefail
 main() {
   export LC_ALL=C
   umask 077
-  local target source_dir ref harness_input skill_input yes overwrite
+  local target source_dir ref harness_input skill_input yes overwrite scope
   target=$(pwd -P); source_dir=''; ref=main; harness_input=''; skill_input=''
-  yes=0; overwrite=0; temp=''; lock=''; stage=''; backup=''
+  scope=''; yes=0; overwrite=0; temp=''; lock=''; stage=''; backup=''
   local -a catalog selected_harnesses selected_skills roots
   catalog=(); selected_harnesses=(); selected_skills=(); roots=()
 
@@ -16,23 +16,24 @@ main() {
   usage() {
     cat <<'HELP'
 Uso: bash install.sh [opções]
-Instala SOMENTE no diretório atual, nunca no HOME automaticamente.
+Instala no projeto (padrão com --yes) ou no HOME após escolha explícita.
+  --scope project|user       Projeto atual ou skills pessoais no HOME
   --harnesses claude,codex,pi  Escolha um ou mais (ou all)
   --skills nome,outra         Escolha skills (ou all)
   --yes                      Confirma instalação sem terminal; NÃO sobrescreve
-  --overwrite                Substitui conflitos, guardando backup no projeto
+  --overwrite                Substitui conflitos, guardando backup no destino
   --ref REF                  Branch, tag ou commit do mariombn/my-skills (main)
   --source-dir DIR           Lê manifesto e skills de um checkout local
   --help                     Mostra esta ajuda
-Sem --harnesses/--skills, há menus de seleção múltipla via /dev/tty.
+Sem --scope (exceto com --yes), --harnesses/--skills, há menus de seleção múltipla via /dev/tty.
 HELP
   }
   while [ "$#" -gt 0 ]; do
     case "$1" in
-      --harnesses|--skills|--ref|--source-dir)
+      --scope|--harnesses|--skills|--ref|--source-dir)
         [ "$#" -ge 2 ] && [ -n "$2" ] || die "Falta valor para $1"
         case "$1" in
-          --harnesses) harness_input=$2;; --skills) skill_input=$2;;
+          --scope) scope=$2;; --harnesses) harness_input=$2;; --skills) skill_input=$2;;
           --ref) ref=$2;; --source-dir) source_dir=$2;;
         esac
         shift 2;;
@@ -40,6 +41,7 @@ HELP
       --help|-h) usage; return 0;; *) die "Opção desconhecida: $1";;
     esac
   done
+  case "$scope" in ''|project|user) ;; *) die 'Escopo inválido: use project ou user.';; esac
   [[ "$ref" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die 'REF inválida (use tag, SHA ou branch sem barras).'
   [ "$yes" -eq 0 ] || { [ -n "$harness_input" ] && [ -n "$skill_input" ]; } || die '--yes exige --harnesses e --skills.'
   if [ -n "$source_dir" ]; then
@@ -114,6 +116,20 @@ HELP
     printf '%s' "$1" >&3
     IFS= read -r answer <&3 || die 'Entrada cancelada.'
   }
+  if [ -z "$scope" ]; then
+    if [ "$yes" -eq 1 ]; then scope=project
+    else
+      prompt $'Escolha o escopo:\n  1) Projeto atual (padrão)\n  2) Usuário (HOME, disponível entre projetos)\nEscopo [1]: '
+      case "$answer" in ''|1|project) scope=project;; 2|user) scope=user;;
+        *) die 'Escopo inválido: use 1/project ou 2/user.';; esac
+    fi
+  fi
+  if [ "$scope" = user ]; then
+    case "${HOME:-}" in /*) ;; *) die 'HOME deve ser um diretório absoluto existente para --scope user.';; esac
+    [ -d "$HOME" ] || die 'HOME deve ser um diretório absoluto existente para --scope user.'
+    target=$(cd "$HOME" && pwd -P) || die 'Não foi possível acessar HOME.'
+    [ "$target" != / ] || die 'HOME não pode ser a raiz do sistema.'
+  fi
   if [ -z "$harness_input" ]; then
     prompt $'Escolha os agentes (números separados por vírgula):\n  1) Claude Code\n  2) Codex\n  3) Pi\n  all) Todos\n> '
     harness_input=$answer
@@ -156,14 +172,30 @@ HELP
     for existing in "${selected_skills[@]}"; do [ "$existing" != "$name" ] || found=1; done
     [ "$found" -eq 1 ] || selected_skills+=("$name")
   done
+  # Explicit built-in dependency; never execute metadata or skill contents.
+  # Keep this mapping and its tests in sync when adding dependent skills.
+  found=0
+  for name in "${selected_skills[@]}"; do [ "$name" != grill-me ] || found=1; done
+  if [ "$found" -eq 1 ]; then
+    found=0
+    for name in "${catalog[@]}"; do [ "$name" != grilling ] || found=1; done
+    [ "$found" -eq 1 ] || die 'Dependência ausente no catálogo: grill-me exige grilling.'
+    found=0
+    for name in "${selected_skills[@]}"; do [ "$name" != grilling ] || found=1; done
+    if [ "$found" -eq 0 ]; then
+      selected_skills+=(grilling)
+      printf 'Dependência adicionada: grilling (exigida por grill-me).\n'
+    fi
+  fi
   for name in "${selected_harnesses[@]}"; do
     case "$name" in claude) path=.claude/skills;; codex|pi) path=.agents/skills;; esac
     found=0
     for existing in "${roots[@]}"; do [ "$existing" != "$path" ] || found=1; done
     [ "$found" -eq 1 ] || roots+=("$path")
   done
-  printf '\nProjeto: %s\nAgentes: %s\nSkills: %s\n' "$target" "${selected_harnesses[*]}" "${selected_skills[*]}"
-  printf 'Destinos: %s\n' "${roots[*]}"
+  printf '\nEscopo: %s\nBase: %s\nAgentes: %s\nSkills: %s\n' "$scope" "$target" "${selected_harnesses[*]}" "${selected_skills[*]}"
+  printf 'Destinos absolutos:\n'
+  for path in "${roots[@]}"; do printf '  %s/%s\n' "$target" "$path"; done
   printf 'Codex e Pi compartilham .agents/skills; ambos podem descobrir essas skills.\n'
   if [ "$overwrite" -eq 1 ]; then printf 'Conflitos serão substituídos com backup preservado.\n';
   else printf 'Skills existentes serão preservadas (ignoradas).\n'; fi
@@ -171,7 +203,7 @@ HELP
     prompt 'Instalar? [s/N] '
     case "$answer" in s|S|sim|y|Y|yes) ;; *) printf 'Cancelado.\n'; return 0;; esac
   fi
-  # Download and verify everything selected before touching the project.
+  # Download and verify everything selected before touching the selected destination.
   local actual
   while read -r digest path extra || [ -n "${digest:-}" ]; do
     [ -n "$digest" ] || continue
@@ -185,7 +217,7 @@ HELP
     actual=${actual%% *}
     [ "$actual" = "$digest" ] || die "SHA-256 divergente: $path; nenhum arquivo foi instalado."
   done < "$temp/manifest.sha256"
-  # Preflight ALL destinations, then acquire an installer-specific project lock.
+  # Preflight ALL destinations, then acquire an installer-specific lock in the selected base.
   local root dest count=0 skipped=0
   for root in "${roots[@]}"; do
     check_path "$target" "$root"
